@@ -3,11 +3,10 @@ import { getDefaultWallets, RainbowKitProvider } from "@rainbow-me/rainbowkit";
 import { configureChains, createClient, WagmiConfig } from "wagmi";
 import { polygon, polygonMumbai } from "wagmi/chains";
 import { alchemyProvider } from "wagmi/providers/alchemy";
-import { publicProvider } from "wagmi/providers/public";
-import { ALCHEMY_API_KEY } from "@/constants";
+import { ALCHEMY_API_KEY, TEST_NETWORK } from "@/constants";
 
 const { chains, provider } = configureChains(
-  [polygon, polygonMumbai],
+  [TEST_NETWORK ? polygonMumbai : polygon],
   [alchemyProvider({ apiKey: ALCHEMY_API_KEY })]
 );
 
