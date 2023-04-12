@@ -1,24 +1,37 @@
 import Image from "next/image";
 import { Inter } from "next/font/google";
 import { useEffect, useState, Fragment } from "react";
+import { ApolloClient, InMemoryCache, gql } from "@apollo/client";
 
-import fs from "fs";
+const client = new ApolloClient({
+  uri: SUBGRAPH_URL,
+  cache: new InMemoryCache(),
+});
 
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const inter = Inter({ subsets: ["latin"] });
 
 import { useConnectModal } from "@rainbow-me/rainbowkit";
-import { useAccount } from "wagmi";
+import { useAccount, useProvider, useSigner } from "wagmi";
 import {
   AWS_ACCESS_KEY,
   AWS_REGION,
   AWS_SECRET_ACCESS,
+  BUTTON_TEXT,
+  CONTRACT_ABI,
+  CONTRACT_ADDRESS,
   MEDIA_BUCKET_URL,
+  NO_OF_TOKENS,
   S3_BUCKET_NAME_MEDIA,
   S3_BUCKET_NAME_METADATA,
+  SUBGRAPH_URL,
 } from "@/constants";
-import { generateFileNameFromTokenID } from "@/utils";
+import { generateFileNameFromTokenID, generateOpenseaUrl } from "@/utils";
+import { ethers } from "ethers";
+import TOTAL_SUPPLY_QUERY from "@/graphql/totalSupply.query";
+import { toast, Toaster } from "react-hot-toast";
+import SuccessModal from "@/components/Modal";
 
 const FILE_TYPES = {
   IMAGE: 0,
@@ -45,9 +58,15 @@ export default function Home() {
   const [file, setFile] = useState<File>(null);
   const [fileType, setFileType] = useState(0);
   const [previewImage, setPreviewImage] = useState(null);
-  const [isMintDisabled, setIsMintDisabled] = useState(false);
+  const [isMintDisabled, setIsMintDisabled] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [buttonText, setButtonText] = useState(BUTTON_TEXT.INITIAL);
+  const [showModal, setShowModal] = useState(false);
 
-  const [progressUpload, setProgressUpload] = useState(0);
+  const [openSeaUrl, setOpenSeaUrl] = useState("");
+
+  const provider = useProvider();
+  const { data: signer } = useSigner();
 
   const uploadToS3 = async (file: File, fileName: string, Bucket) => {
     if (!file) {
@@ -115,14 +134,18 @@ export default function Home() {
     setFile(file);
   };
 
-  const removeAllFiles = (e) => {
-    e.preventDefault();
+  const removeAllFiles = () => {
     setFile(null);
     setPreviewImage(null);
   };
 
-  const removePreview = (e) => {
-    e.preventDefault();
+  const reset = () => {
+    setUserWallet("");
+    setNftName("");
+    setNftDesc("");
+  };
+
+  const removePreview = () => {
     setPreviewImage(null);
   };
 
@@ -367,18 +390,52 @@ export default function Home() {
   };
 
   const handleMint = async (e) => {
+    setButtonText(BUTTON_TEXT.UPLOADING);
+    setLoading(true);
+    setIsMintDisabled(true);
+    const supplyData = await client.query({
+      query: TOTAL_SUPPLY_QUERY,
+      variables: {
+        address: CONTRACT_ADDRESS,
+      },
+    });
+
+    const tokenId = `${
+      parseInt(supplyData.data.collections[0].totalSupply) + 1
+    }`;
+
+    setOpenSeaUrl(generateOpenseaUrl(tokenId));
+
     if (!file) {
       return;
     }
 
-    const tokenId = "1";
-
     const mediaFileName = generateFileNameFromTokenID(file, tokenId);
     const previewFileName = generateFileNameFromTokenID(previewImage, tokenId);
 
-    await uploadToS3(file, mediaFileName, S3_BUCKET_NAME_MEDIA);
+    try {
+      await uploadToS3(file, mediaFileName, S3_BUCKET_NAME_MEDIA);
+    } catch (err) {
+      console.log(err);
+      toast.error("Something went wrong with uploading Media File");
+      setButtonText(BUTTON_TEXT.INITIAL);
+      setLoading(false);
+      setIsMintDisabled(false);
+      removeAllFiles();
+      reset;
+    }
     if (fileType !== FILE_TYPES.IMAGE) {
-      await uploadToS3(previewImage, previewFileName, S3_BUCKET_NAME_MEDIA);
+      try {
+        await uploadToS3(previewImage, previewFileName, S3_BUCKET_NAME_MEDIA);
+      } catch (err) {
+        console.log({ err });
+        toast.error("Something went wrong with uploading Preview File");
+        setButtonText(BUTTON_TEXT.INITIAL);
+        setLoading(false);
+        setIsMintDisabled(false);
+        removeAllFiles();
+        reset();
+      }
     }
 
     const metadataBody = {
@@ -391,24 +448,89 @@ export default function Home() {
       metadataBody["animation_url"] = `${MEDIA_BUCKET_URL}${mediaFileName}`;
     }
 
-    const metadataFile = new File(
-      [JSON.stringify(metadataBody)],
-      `${tokenId}.json`
+    try {
+      await uploadJsonToS3(
+        metadataBody,
+        `${tokenId}.json`,
+        S3_BUCKET_NAME_METADATA
+      );
+    } catch (err) {
+      console.log({ err });
+      toast.error("Something went wrong with uploading metadata.");
+      setLoading(false);
+      setButtonText(BUTTON_TEXT.INITIAL);
+      setIsMintDisabled(false);
+      removeAllFiles();
+      reset();
+    }
+
+    const CONTRACT = new ethers.Contract(
+      CONTRACT_ADDRESS,
+      CONTRACT_ABI,
+      provider
     );
 
-    console.log({ metadataBody, metadataFile });
+    if (CONTRACT) {
+      setButtonText(BUTTON_TEXT.METAMASK);
+      try {
+        const transaction = await CONTRACT.connect(signer).buy(
+          userWallet,
+          NO_OF_TOKENS,
+          {
+            value: 0,
+          }
+        );
 
-    await uploadJsonToS3(
-      metadataBody,
-      `${tokenId}.json`,
-      S3_BUCKET_NAME_METADATA
-    );
+        setButtonText(BUTTON_TEXT.PENDING);
 
-    console.log({ complete: "complete" });
+        transaction
+          .wait()
+          .then((tx: any) => {
+            console.log("Minted");
+            toast.success("Success!!");
+            setShowModal(true);
+            setLoading(false);
+            setButtonText(BUTTON_TEXT.INITIAL);
+            setIsMintDisabled(false);
+            removeAllFiles();
+            reset();
+          })
+          .catch((err: any, tx: any) => {
+            console.log({ err });
+            toast.error("Something went wrong with the transaction.");
+            setButtonText(BUTTON_TEXT.INITIAL);
+            setLoading(false);
+            setIsMintDisabled(false);
+            removeAllFiles();
+          });
+      } catch (err) {
+        console.log({ err });
+        toast.error("Something went wrong with the transaction.");
+        setButtonText(BUTTON_TEXT.INITIAL);
+        setIsMintDisabled(false);
+        setLoading(false);
+        removeAllFiles();
+      }
+      reset();
+    } else {
+      console.log("Error");
+      setButtonText(BUTTON_TEXT.INITIAL);
+      setLoading(false);
+      setIsMintDisabled(false);
+      removeAllFiles();
+    }
   };
 
   return (
     <main className="flex min-h-screen  flex-col">
+      <div>
+        <Toaster />
+      </div>
+      {showModal ? (
+        <div className="fixed h-screen w-screen flex flex-row justify-center items-center z-10 bg-[#00000070]">
+          <SuccessModal setShowModal={setShowModal} openseaUrl={openSeaUrl} />
+        </div>
+      ) : null}
       {/* ==========Navbar========== */}
       <div className="navbar bg-base-100 fixed">
         <a className="btn btn-ghost normal-case text-xl">Simplr</a>
@@ -496,11 +618,13 @@ export default function Home() {
                 </div>
               </div>
               <button
-                className="btn btn-primary mt-8 w-2/5 self-center"
-                disabled={isMintDisabled}
+                className={`btn btn-primary ${
+                  loading ? "loading" : ""
+                } mt-8 w-2/5 self-center`}
+                // disabled={isMintDisabled}
                 onClick={handleMint}
               >
-                Mint
+                {buttonText}
               </button>
             </div>
           )}
